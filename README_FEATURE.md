@@ -10,14 +10,14 @@ Upstream `skillshare` is optimized for one-way distribution from a central skill
 - the project should use the in-progress skill immediately
 - the resulting skill should be promoted back into the shared skills repository through a feature branch
 
-This branch adds a `skillshare worktree` command family to support that loop directly:
+This fork adds a `skillshare worktree` command family to support that loop directly:
 
 1. create a feature worktree
 2. attach one or more development targets to that worktree
 3. sync existing skills into the project
 4. build or edit a skill inside the project
 5. collect the skill back into the worktree source and link the project to it
-6. merge the worktree branch back to the main repo with merge-time guardrails
+6. merge the worktree branch back to the central skills repo with merge-time guardrails
 
 ## Repository Shape
 
@@ -32,28 +32,27 @@ skills-repo/
         SKILL.md
 ```
 
-The main repo owns the shared source of truth. Each worktree gets its own local `.skillshare/config.yaml` for development targets.
+This central skills repo owns the shared source of truth. Each worktree gets its own local `.skillshare/config.yaml` for development targets.
 
-## Build
+## Build This Fork
 
 ```bash
 cd <fork-repo>
+eval "$(/home/fenix/.local/bin/mise activate bash)"
 go build -o ./bin/skillshare ./cmd/skillshare
 sudo cp ./bin/skillshare /usr/local/bin/skillshare
 ```
 
 ## Standard Distribution Flow
 
-The normal centralized distribution flow remains unchanged:
+The normal centralized distribution flow remains unchanged (see: [Recipes/Centralized Skills Repo](https://skillshare.runkids.cc/docs/how-to/recipes/centralized-skills-repo)):
 
 ```bash
-# in the main skills repo
+# in the central skills repo
 skillshare sync -p
 skillshare push
 skillshare pull
 ```
-
-If you want a self-contained release target instead of symlinks, configure that target with `mode: copy`.
 
 ```yaml
 targets:
@@ -69,9 +68,9 @@ targets:
 
 ## Worktree Development Flow
 
-### Main repo setup
+### Skills-repo Setup
 
-Create the project first and register it in the main repo if you want post-merge repair syncs to be meaningful.
+In a generic scenario, a project already exists and is registered in the config.yaml of skills-repo.
 
 ```yaml
 # skills-repo/.skillshare/config.yaml
@@ -82,7 +81,7 @@ targets:
       mode: merge
 ```
 
-### Core loop
+### Core Loop
 
 ```bash
 # 1. create a feature worktree
@@ -107,10 +106,10 @@ skillshare worktree collect claude
 git add -A
 git commit -m "add my-skill"
 
-# 8. merge back to the main repo
+# 8. merge back to the central skills repo
 skillshare worktree merge feat/my-skill
 
-# 9. push and distribute from the main repo
+# 9. push and distribute from the central skills repo
 git push
 skillshare sync -p
 ```
@@ -140,7 +139,7 @@ audit:
   block_threshold: CRITICAL
 ```
 
-Targets are intentionally not copied from the main repo. Each worktree declares its own development targets locally.
+Targets are intentionally not copied from the central skills repo. Each worktree declares its own development targets locally.
 
 ## Command Reference
 
@@ -233,7 +232,7 @@ Behavior:
 
 ### `skillshare worktree merge <branch>`
 
-Merges the feature branch back to the main repo and removes the worktree.
+Merges the feature branch back to the central skills repo and removes the worktree.
 
 ```bash
 skillshare worktree merge feat/my-skill
@@ -253,7 +252,7 @@ If a Git merge conflict occurs, the merge is aborted and the worktree is preserv
 
 ### Before merge
 
-If the main repo already has `.skillshare/config.yaml`, the command runs the equivalent of:
+If the central skills repo already has `.skillshare/config.yaml`, the command runs the equivalent of:
 
 ```bash
 skillshare sync -p --dry-run --json
@@ -268,7 +267,7 @@ A clean preview does not block the merge.
 
 ### After merge
 
-After a successful merge and worktree removal, the command runs a second project sync dry-run preview from the main repo and compares the before/after target states.
+After a successful merge and worktree removal, the command runs a second project sync dry-run preview from the central skills repo and compares the before/after target states.
 
 If only one target newly needs repair, the command prints a focused recommendation to run:
 
@@ -285,12 +284,12 @@ These guardrails are advisory only. `worktree merge` never performs a real proje
 - bare `skillshare collect` is blocked outside the intended worktree flow
 - `skillshare worktree collect` links collected skills back into the target immediately
 - `skillshare worktree merge` performs safety checks before merging unless `--force` is used
-- worktree-local targets stay local to the worktree config and are not promoted into the main repo automatically
+- worktree-local targets stay local to the worktree config and are not promoted into the central skills repo automatically
 
 ## Practical Notes
 
-- To keep a target healthy after merge, configure that same target in the main repo as well as in the worktree.
-- If the main repo does not have project config, merge preview checks are skipped.
+- To keep a target healthy after merge, configure that same target in the central skills repo as well as in the worktree.
+- If the central skills repo does not have project config, merge preview checks are skipped.
 - `worktree merge` detects `main` first and falls back to `master`.
-- The source path for collected skills is `.skillshare/skills/`, so the main repo should follow that layout for the smoothest workflow.
+- The source path for collected skills is `.skillshare/skills/`, so the central skills repo should follow that layout for the smoothest workflow.
 
