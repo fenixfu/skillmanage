@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"skillshare/internal/config"
@@ -415,6 +416,9 @@ func worktreeMerge(args []string) error {
 		ui.Warning("%d broken symlink(s) detected (--force: proceeding anyway)", len(broken))
 	}
 
+	prePreview, prePreviewErr := runProjectSyncDryRunPreview(repoPath)
+	reportPreMergeSyncPreview(prePreview, prePreviewErr)
+
 	// Switch to main branch in main repo
 	ui.Header(fmt.Sprintf("Merging %s", branch))
 	mainBranch := detectMainBranch(repoPath)
@@ -438,6 +442,9 @@ func worktreeMerge(args []string) error {
 	} else {
 		ui.Success("Removed worktree for branch %q", branch)
 	}
+
+	postPreview, postPreviewErr := runProjectSyncDryRunPreview(repoPath)
+	reportPostMergeSyncPreview(prePreview, prePreviewErr, postPreview, postPreviewErr)
 
 	// Next steps
 	fmt.Println()
@@ -536,6 +543,173 @@ func gitMergeAbort(repoPath string) error {
 	cmd := exec.Command("git", "-C", repoPath, "merge", "--abort")
 	cmd.Run() // best-effort
 	return nil
+}
+
+func runProjectSyncDryRunPreview(root string) (*syncJSONOutput, error) {
+	if !projectConfigExists(root) {
+		return nil, nil
+	}
+
+	stats, results, iStats, ctxCost, err := cmdSyncProject(root, true, false, true, true)
+
+	var totals syncModeStats
+	details := make([]syncJSONTargetDetail, 0, len(results))
+	for _, r := range results {
+		totals.linked += r.stats.linked
+		totals.local += r.stats.local
+		totals.updated += r.stats.updated
+		totals.pruned += r.stats.pruned
+		details = append(details, syncJSONTargetDetail{
+			Name:    r.name,
+			Mode:    r.mode,
+			Linked:  r.stats.linked,
+			Local:   r.stats.local,
+			Updated: r.stats.updated,
+			Pruned:  r.stats.pruned,
+			Error:   r.errMsg,
+		})
+	}
+
+	ignoredSkills := []string{}
+	if iStats != nil && len(iStats.IgnoredSkills) > 0 {
+		ignoredSkills = iStats.IgnoredSkills
+	}
+
+	return &syncJSONOutput{
+		Targets:       len(results),
+		Linked:        totals.linked,
+		Local:         totals.local,
+		Updated:       totals.updated,
+		Pruned:        totals.pruned,
+		IgnoredCount:  len(ignoredSkills),
+		IgnoredSkills: ignoredSkills,
+		DryRun:        stats.DryRun,
+		Details:       details,
+		ContextCost:   ctxCost,
+	}, err
+}
+
+func reportPreMergeSyncPreview(preview *syncJSONOutput, previewErr error) {
+	if previewErr != nil {
+		ui.Warning("Could not preview project sync state before merge: %v", previewErr)
+		return
+	}
+	if preview == nil {
+		return
+	}
+
+	localTargets := previewTargetsMatching(preview, func(detail syncJSONTargetDetail) bool {
+		return detail.Local > 0
+	})
+	if len(localTargets) > 0 {
+		ui.Warning("Some targets already have unmanaged local content before merge.")
+		ui.Info("Save or reconcile those changes before running a full 'skillshare sync -p'.")
+		ui.Info("Affected targets: %s", strings.Join(localTargets, ", "))
+		return
+	}
+
+	driftTargets := previewTargetsMatching(preview, previewHasDrift)
+	if len(driftTargets) > 0 {
+		ui.Warning("Some targets are already out of sync before merge.")
+		ui.Info("Affected targets: %s", strings.Join(driftTargets, ", "))
+		return
+	}
+
+	ui.Info("Pre-merge 'skillshare sync -p --dry-run --json' preview is clean.")
+}
+
+func reportPostMergeSyncPreview(prePreview *syncJSONOutput, preErr error, postPreview *syncJSONOutput, postErr error) {
+	if postErr != nil {
+		ui.Warning("Could not preview project sync state after merge: %v", postErr)
+		return
+	}
+	if postPreview == nil {
+		return
+	}
+
+	changedTargets := diffPreviewTargets(prePreview, postPreview)
+	if len(changedTargets) == 1 && preErr == nil {
+		target := changedTargets[0]
+		preDetail, _ := previewTargetDetail(prePreview, target)
+		postDetail, _ := previewTargetDetail(postPreview, target)
+		if !previewHasDrift(preDetail) && postDetail.Local == 0 && previewHasDrift(postDetail) {
+			ui.Warning("Target %q now needs sync repair after merge.", target)
+			ui.Info("Run 'skillshare sync -p' now to repair the merged skill link.")
+			return
+		}
+	}
+
+	if len(changedTargets) > 0 {
+		ui.Warning("Project sync preview changed after merge.")
+		ui.Info("Affected targets: %s", strings.Join(changedTargets, ", "))
+		ui.Info("Run 'skillshare sync -p --dry-run --json' to inspect drift before a full sync.")
+		return
+	}
+
+	driftTargets := previewTargetsMatching(postPreview, previewHasDrift)
+	if len(driftTargets) > 0 {
+		ui.Warning("Some targets remain out of sync after merge.")
+		ui.Info("Affected targets: %s", strings.Join(driftTargets, ", "))
+		ui.Info("Run 'skillshare sync -p --dry-run --json' to inspect drift before a full sync.")
+	}
+}
+
+func previewTargetsMatching(preview *syncJSONOutput, match func(syncJSONTargetDetail) bool) []string {
+	if preview == nil {
+		return nil
+	}
+	var targets []string
+	for _, detail := range preview.Details {
+		if match(detail) {
+			targets = append(targets, detail.Name)
+		}
+	}
+	sort.Strings(targets)
+	return targets
+}
+
+func previewHasDrift(detail syncJSONTargetDetail) bool {
+	return detail.Linked > 0 || detail.Local > 0 || detail.Updated > 0 || detail.Pruned > 0 || detail.Error != ""
+}
+
+func diffPreviewTargets(pre, post *syncJSONOutput) []string {
+	postMap := make(map[string]syncJSONTargetDetail)
+	for _, detail := range post.Details {
+		postMap[detail.Name] = detail
+	}
+
+	seen := make(map[string]struct{})
+	var changed []string
+	if pre != nil {
+		for _, detail := range pre.Details {
+			seen[detail.Name] = struct{}{}
+			postDetail, ok := postMap[detail.Name]
+			if !ok || detail != postDetail {
+				changed = append(changed, detail.Name)
+			}
+		}
+	}
+	for _, detail := range post.Details {
+		if _, ok := seen[detail.Name]; ok {
+			continue
+		}
+		changed = append(changed, detail.Name)
+	}
+
+	sort.Strings(changed)
+	return changed
+}
+
+func previewTargetDetail(preview *syncJSONOutput, target string) (syncJSONTargetDetail, bool) {
+	if preview == nil {
+		return syncJSONTargetDetail{}, false
+	}
+	for _, detail := range preview.Details {
+		if detail.Name == target {
+			return detail, true
+		}
+	}
+	return syncJSONTargetDetail{}, false
 }
 
 // worktreeTarget dispatches `skillshare worktree target <add|list|remove>`.

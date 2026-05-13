@@ -226,3 +226,218 @@ func TestWorktreeMerge_ForceDirty(t *testing.T) {
 		}
 	}
 }
+
+func TestWorktreeMerge_SyncPreviewDetectsNewRepairNeed(t *testing.T) {
+	tmp := t.TempDir()
+	repo := setupTestRepo(t, tmp)
+	mockTarget := filepath.Join(tmp, "mock-project", ".claude", "skills")
+	if err := os.MkdirAll(mockTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeWorktreeMergeProjectConfig(t, repo, mockTarget)
+
+	wt, err := worktree.Create(repo, "feat/merge-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initWorktreeSkillshare(wt.Path, false); err != nil {
+		t.Fatal(err)
+	}
+	writeWorktreeMergeProjectConfig(t, wt.Path, mockTarget)
+
+	localSkillDir := filepath.Join(mockTarget, "mock-skill")
+	if err := os.MkdirAll(localSkillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localSkillDir, "SKILL.md"), []byte("# Mock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	if err := os.Chdir(wt.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := worktreeCollect([]string{"claude", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("git", "-C", wt.Path, "add", "-A").Run()
+	exec.Command("git", "-C", wt.Path, "commit", "-m", "add mock skill").Run()
+
+	if err := os.Chdir(repo); err != nil {
+		t.Fatal(err)
+	}
+	output := stripANSIWarnings(captureStdout(t, func() {
+		if mergeErr := worktreeMerge([]string{"feat/merge-preview"}); mergeErr != nil {
+			t.Fatalf("worktreeMerge failed: %v", mergeErr)
+		}
+	}))
+
+	if !strings.Contains(output, "sync -p") {
+		t.Fatalf("expected merge output to mention sync guidance, got:\n%s", output)
+	}
+	if !strings.Contains(strings.ToLower(output), "claude") {
+		t.Fatalf("expected merge output to mention the affected target, got:\n%s", output)
+	}
+
+	if _, err := os.Stat(filepath.Join(mockTarget, "mock-skill", "SKILL.md")); !os.IsNotExist(err) {
+		t.Fatalf("expected target skill link to remain broken until a real sync runs; stat err=%v", err)
+	}
+
+	wts, err := worktree.List(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range wts {
+		if w.Branch == "feat/merge-preview" {
+			t.Error("worktree should have been removed after merge")
+		}
+	}
+}
+
+func TestWorktreeMerge_SyncPreviewWarnsOnPreExistingLocalDrift(t *testing.T) {
+	tmp := t.TempDir()
+	repo := setupTestRepo(t, tmp)
+	mockTarget := filepath.Join(tmp, "mock-project", ".claude", "skills")
+	if err := os.MkdirAll(mockTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeWorktreeMergeProjectConfig(t, repo, mockTarget)
+
+	wt, err := worktree.Create(repo, "feat/merge-preview-local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initWorktreeSkillshare(wt.Path, false); err != nil {
+		t.Fatal(err)
+	}
+	writeWorktreeMergeProjectConfig(t, wt.Path, mockTarget)
+
+	localSkillDir := filepath.Join(mockTarget, "mock-skill")
+	if err := os.MkdirAll(localSkillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localSkillDir, "SKILL.md"), []byte("# Mock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	if err := os.Chdir(wt.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := worktreeCollect([]string{"claude", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+
+	extraLocalDir := filepath.Join(mockTarget, "other-local")
+	if err := os.MkdirAll(extraLocalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extraLocalDir, "SKILL.md"), []byte("# Local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	exec.Command("git", "-C", wt.Path, "add", "-A").Run()
+	exec.Command("git", "-C", wt.Path, "commit", "-m", "add mock skill").Run()
+
+	if err := os.Chdir(repo); err != nil {
+		t.Fatal(err)
+	}
+	output := stripANSIWarnings(captureStdout(t, func() {
+		if mergeErr := worktreeMerge([]string{"feat/merge-preview-local"}); mergeErr != nil {
+			t.Fatalf("worktreeMerge failed: %v", mergeErr)
+		}
+	}))
+
+	if !strings.Contains(strings.ToLower(output), "unmanaged local content") {
+		t.Fatalf("expected pre-merge local drift warning, got:\n%s", output)
+	}
+	if !strings.Contains(strings.ToLower(output), "other-local") && !strings.Contains(strings.ToLower(output), "claude") {
+		t.Fatalf("expected warning context for affected target, got:\n%s", output)
+	}
+	if strings.Contains(output, "repair the merged skill link") {
+		t.Fatalf("expected broader warning path instead of narrow repair guidance, got:\n%s", output)
+	}
+}
+
+func TestWorktreeMerge_SyncPreviewFailureIsReported(t *testing.T) {
+	tmp := t.TempDir()
+	repo := setupTestRepo(t, tmp)
+	mockTarget := filepath.Join(tmp, "mock-project", ".claude", "skills")
+	if err := os.MkdirAll(mockTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeWorktreeMergeProjectConfig(t, repo, mockTarget)
+	if err := os.RemoveAll(filepath.Join(repo, ".skillshare", "skills")); err != nil {
+		t.Fatal(err)
+	}
+
+	wt, err := worktree.Create(repo, "feat/merge-preview-failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initWorktreeSkillshare(wt.Path, false); err != nil {
+		t.Fatal(err)
+	}
+	writeWorktreeMergeProjectConfig(t, wt.Path, mockTarget)
+
+	localSkillDir := filepath.Join(mockTarget, "mock-skill")
+	if err := os.MkdirAll(localSkillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localSkillDir, "SKILL.md"), []byte("# Mock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	if err := os.Chdir(wt.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := worktreeCollect([]string{"claude", "--force"}); err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("git", "-C", wt.Path, "add", "-A").Run()
+	exec.Command("git", "-C", wt.Path, "commit", "-m", "add mock skill").Run()
+
+	if err := os.Chdir(repo); err != nil {
+		t.Fatal(err)
+	}
+	output := stripANSIWarnings(captureStdout(t, func() {
+		if mergeErr := worktreeMerge([]string{"feat/merge-preview-failure"}); mergeErr != nil {
+			t.Fatalf("worktreeMerge failed: %v", mergeErr)
+		}
+	}))
+
+	if !strings.Contains(strings.ToLower(output), "could not preview project sync state before merge") {
+		t.Fatalf("expected preview failure warning, got:\n%s", output)
+	}
+}
+
+func writeWorktreeMergeProjectConfig(t *testing.T, root, targetPath string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, ".skillshare", "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.ProjectConfig{
+		Targets: []config.ProjectTargetEntry{
+			{
+				Name: "claude",
+				Skills: &config.ResourceTargetConfig{
+					Path: targetPath,
+					Mode: "merge",
+				},
+			},
+		},
+		Audit: config.AuditConfig{
+			BlockThreshold: "CRITICAL",
+		},
+	}
+	if err := cfg.Save(root); err != nil {
+		t.Fatal(err)
+	}
+}
