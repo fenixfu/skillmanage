@@ -35,6 +35,8 @@ func cmdWorktree(args []string) error {
 		return worktreeRemove(subargs)
 	case "collect":
 		return worktreeCollect(subargs)
+	case "target":
+		return worktreeTarget(subargs)
 	default:
 		return fmt.Errorf("unknown worktree subcommand: %s\nRun 'skillshare worktree --help'", subcmd)
 	}
@@ -291,6 +293,174 @@ func worktreeRemove(args []string) error {
 	return nil
 }
 
+// worktreeTarget dispatches `skillshare worktree target <add|list|remove>`.
+func worktreeTarget(args []string) error {
+	if len(args) < 1 {
+		printWorktreeTargetHelp()
+		return nil
+	}
+
+	subcmd := args[0]
+	subargs := args[1:]
+
+	switch subcmd {
+	case "help", "--help", "-h":
+		printWorktreeTargetHelp()
+		return nil
+	case "add":
+		return worktreeTargetAdd(subargs)
+	case "list":
+		return worktreeTargetList(subargs)
+	case "remove", "rm":
+		return worktreeTargetRemove(subargs)
+	default:
+		return fmt.Errorf("unknown target subcommand: %s\nRun 'skillshare worktree target --help'", subcmd)
+	}
+}
+
+func worktreeTargetAdd(args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: skillshare worktree target add <name> <path>\nRun 'skillshare worktree target add --help' for details")
+	}
+	targetName := args[0]
+	targetPath := args[1]
+
+	// Expand ~
+	if strings.HasPrefix(targetPath, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("cannot expand ~: %w", err)
+		}
+		targetPath = filepath.Join(home, targetPath[1:])
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("cannot determine working directory: %w", err)
+	}
+	if !isWorktreeDir(cwd) {
+		return fmt.Errorf("not in a git worktree (run 'skillshare worktree create <branch>' first)")
+	}
+
+	cfg, err := config.LoadProject(cwd)
+	if err != nil {
+		return fmt.Errorf("failed to load worktree config: %w", err)
+	}
+
+	// Check for duplicate name
+	for _, t := range cfg.Targets {
+		if t.Name == targetName {
+			return fmt.Errorf("target %q already exists in worktree config", targetName)
+		}
+	}
+
+	// Add target with merge mode
+	cfg.Targets = append(cfg.Targets, config.ProjectTargetEntry{
+		Name: targetName,
+		Skills: &config.ResourceTargetConfig{
+			Path: targetPath,
+			Mode: "merge",
+		},
+	})
+
+	if err := cfg.Save(cwd); err != nil {
+		return fmt.Errorf("failed to save worktree config: %w", err)
+	}
+
+	ui.Success("Added target %q -> %s", targetName, targetPath)
+	ui.Info("Run 'skillshare sync -p' to symlink skills to this target")
+	return nil
+}
+
+func worktreeTargetList(args []string) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("cannot determine working directory: %w", err)
+	}
+	if !isWorktreeDir(cwd) {
+		return fmt.Errorf("not in a git worktree (run 'skillshare worktree create <branch>' first)")
+	}
+
+	cfg, err := config.LoadProject(cwd)
+	if err != nil {
+		return fmt.Errorf("failed to load worktree config: %w", err)
+	}
+
+	if len(cfg.Targets) == 0 {
+		ui.Info("No targets configured.")
+		ui.Info("Add one: skillshare worktree target add <name> <path>")
+		return nil
+	}
+
+	ui.Header("Worktree Targets")
+	for _, t := range cfg.Targets {
+		sc := t.SkillsConfig()
+		mode := sc.Mode
+		if mode == "" {
+			mode = "merge"
+		}
+		ui.Info("  %-20s %-10s %s", t.Name, mode, sc.Path)
+	}
+	return nil
+}
+
+func worktreeTargetRemove(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: skillshare worktree target remove <name>\nRun 'skillshare worktree target remove --help' for details")
+	}
+	targetName := args[0]
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("cannot determine working directory: %w", err)
+	}
+	if !isWorktreeDir(cwd) {
+		return fmt.Errorf("not in a git worktree (run 'skillshare worktree create <branch>' first)")
+	}
+
+	cfg, err := config.LoadProject(cwd)
+	if err != nil {
+		return fmt.Errorf("failed to load worktree config: %w", err)
+	}
+
+	found := false
+	var newTargets []config.ProjectTargetEntry
+	for _, t := range cfg.Targets {
+		if t.Name == targetName {
+			found = true
+		} else {
+			newTargets = append(newTargets, t)
+		}
+	}
+	if !found {
+		return fmt.Errorf("target %q not found in worktree config", targetName)
+	}
+
+	cfg.Targets = newTargets
+	if err := cfg.Save(cwd); err != nil {
+		return fmt.Errorf("failed to save worktree config: %w", err)
+	}
+
+	ui.Success("Removed target %q", targetName)
+	return nil
+}
+
+func printWorktreeTargetHelp() {
+	fmt.Println("Usage: skillshare worktree target <subcommand> [options]")
+	fmt.Println()
+	fmt.Println("Manage development targets in a worktree's .skillshare/config.yaml.")
+	fmt.Println()
+	fmt.Println("SUBCOMMANDS")
+	fmt.Println("  add <name> <path>     Add a development target")
+	fmt.Println("  list                  List configured targets")
+	fmt.Println("  remove <name>         Remove a target")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  skillshare worktree target add claude ~/DEV/my-project/.claude/skills")
+	fmt.Println("  skillshare worktree target list")
+	fmt.Println("  skillshare worktree target remove claude")
+}
+
 func printWorktreeHelp() {
 	fmt.Println("Usage: skillshare worktree <subcommand> [options]")
 	fmt.Println()
@@ -301,6 +471,8 @@ func printWorktreeHelp() {
 	fmt.Println("  list                      List all worktrees")
 	fmt.Println("  select <branch>           Print the worktree path for the branch")
 	fmt.Println("  remove <branch> [--force] Remove a worktree")
+	fmt.Println("  target <subcommand>       Manage targets in the worktree")
+	fmt.Println("  collect <target>          Collect local skills from a target")
 	fmt.Println()
 	fmt.Println("Run 'skillshare worktree <subcommand> --help' for more details.")
 }
