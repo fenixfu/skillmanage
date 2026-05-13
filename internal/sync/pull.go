@@ -25,8 +25,9 @@ type LocalSkillInfo struct {
 
 // PullOptions holds options for pull operation
 type PullOptions struct {
-	DryRun bool
-	Force  bool
+	DryRun   bool
+	Force    bool
+	LinkBack bool // if true, replace target local dir with symlink to source after pull
 }
 
 // PullResult describes the result of a pull operation
@@ -123,13 +124,15 @@ func FindLocalSkills(targetPath, sourcePath, syncMode string) ([]LocalSkillInfo,
 	return skills, nil
 }
 
-// PullSkill copies a single skill from target to source
-func PullSkill(skill LocalSkillInfo, sourcePath string, force bool) error {
+// PullSkill copies a single skill from target to source.
+// If opts.LinkBack is true, the target's local directory is replaced with
+// a symlink to the newly created source directory after the copy completes.
+func PullSkill(skill LocalSkillInfo, sourcePath string, opts PullOptions) error {
 	destPath := filepath.Join(sourcePath, skill.Name)
 
 	// Check if skill already exists in source
 	if _, err := os.Stat(destPath); err == nil {
-		if !force {
+		if !opts.Force {
 			return ErrAlreadyExists
 		}
 		// Remove existing to overwrite
@@ -138,9 +141,27 @@ func PullSkill(skill LocalSkillInfo, sourcePath string, force bool) error {
 		}
 	}
 
+	if opts.DryRun {
+		return nil
+	}
+
 	// Copy skill to source, skipping .git directories (collect brings
 	// user content, not repository metadata).
-	return copyDirectorySkipGit(skill.Path, destPath)
+	if err := copyDirectorySkipGit(skill.Path, destPath); err != nil {
+		return err
+	}
+
+	// Replace target local directory with a symlink to source
+	if opts.LinkBack {
+		if err := os.RemoveAll(skill.Path); err != nil {
+			return fmt.Errorf("linkback: failed to remove target local dir: %w", err)
+		}
+		if err := createLink(skill.Path, destPath, false); err != nil {
+			return fmt.Errorf("linkback: failed to create symlink: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // PullSkills pulls multiple skills to source
@@ -155,7 +176,7 @@ func PullSkills(skills []LocalSkillInfo, sourcePath string, opts PullOptions) (*
 			continue
 		}
 
-		err := PullSkill(skill, sourcePath, opts.Force)
+		err := PullSkill(skill, sourcePath, opts)
 		if err != nil {
 			if errors.Is(err, ErrAlreadyExists) {
 				result.Skipped = append(result.Skipped, skill.Name)

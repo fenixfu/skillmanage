@@ -179,7 +179,7 @@ func TestPullSkill_NewSkill(t *testing.T) {
 		Path: localSkill,
 	}
 
-	if err := PullSkill(skill, src, false); err != nil {
+	if err := PullSkill(skill, src, PullOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -210,7 +210,7 @@ func TestPullSkill_NestedDirectories(t *testing.T) {
 		Path: localSkill,
 	}
 
-	if err := PullSkill(skill, src, false); err != nil {
+	if err := PullSkill(skill, src, PullOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -265,7 +265,7 @@ func TestPullSkill_GitRepoSkipsGit(t *testing.T) {
 		Path: localSkill,
 	}
 
-	if err := PullSkill(skill, src, false); err != nil {
+	if err := PullSkill(skill, src, PullOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -311,7 +311,7 @@ func TestPullSkill_AlreadyExists(t *testing.T) {
 		Path: localSkill,
 	}
 
-	err := PullSkill(skill, src, false)
+	err := PullSkill(skill, src, PullOptions{})
 	if err == nil {
 		t.Error("expected error when skill already exists")
 	}
@@ -336,7 +336,7 @@ func TestPullSkill_ForceOverwrite(t *testing.T) {
 		Path: localSkill,
 	}
 
-	if err := PullSkill(skill, src, true); err != nil {
+	if err := PullSkill(skill, src, PullOptions{Force: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -347,5 +347,84 @@ func TestPullSkill_ForceOverwrite(t *testing.T) {
 	}
 	if string(data) != "new" {
 		t.Errorf("expected 'new' content after force pull, got %q", string(data))
+	}
+}
+
+func TestPullSkill_LinkBack(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "source")
+	tgt := filepath.Join(tmp, "target")
+
+	os.MkdirAll(src, 0755)
+
+	localSkill := filepath.Join(tgt, "my-skill")
+	os.MkdirAll(localSkill, 0755)
+	os.WriteFile(filepath.Join(localSkill, "SKILL.md"), []byte("# My Skill"), 0644)
+
+	skill := LocalSkillInfo{
+		Name: "my-skill",
+		Path: localSkill,
+	}
+
+	err := PullSkill(skill, src, PullOptions{LinkBack: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Skill should exist in source
+	if _, err := os.Stat(filepath.Join(src, "my-skill", "SKILL.md")); err != nil {
+		t.Error("expected SKILL.md in source after pull")
+	}
+
+	// Target should be a symlink now (not a directory)
+	info, err := os.Lstat(localSkill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Error("expected target to be replaced by symlink")
+	}
+
+	// Symlink should point to the source directory
+	resolved, err := os.Readlink(localSkill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("symlink: %s -> %s", localSkill, resolved)
+}
+
+func TestPullSkill_LinkBackDryRun(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "source")
+	tgt := filepath.Join(tmp, "target")
+
+	os.MkdirAll(src, 0755)
+
+	localSkill := filepath.Join(tgt, "my-skill")
+	os.MkdirAll(localSkill, 0755)
+	os.WriteFile(filepath.Join(localSkill, "SKILL.md"), []byte("# My Skill"), 0644)
+
+	skill := LocalSkillInfo{
+		Name: "my-skill",
+		Path: localSkill,
+	}
+
+	err := PullSkill(skill, src, PullOptions{DryRun: true, LinkBack: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Source should NOT have the skill (dry run)
+	if _, err := os.Stat(filepath.Join(src, "my-skill")); !os.IsNotExist(err) {
+		t.Error("expected source to be empty after dry-run pull")
+	}
+
+	// Target should still be a real directory (not replaced with symlink)
+	info, err := os.Lstat(localSkill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Error("expected target to remain as directory after dry-run")
 	}
 }

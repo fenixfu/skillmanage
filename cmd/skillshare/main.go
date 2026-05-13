@@ -48,6 +48,7 @@ var commands = map[string]func([]string) error{
 	"enable":     cmdEnable,
 	"disable":    cmdDisable,
 	"completion": cmdCompletion,
+	"worktree":   cmdWorktree,
 }
 
 func main() {

@@ -508,7 +508,7 @@ func TestPullSkill_SourceIsSymlink(t *testing.T) {
 	os.WriteFile(filepath.Join(localSkill, "SKILL.md"), []byte("# New"), 0644)
 
 	skill := LocalSkillInfo{Name: "new-skill", Path: localSkill}
-	if err := PullSkill(skill, symlinkSource, false); err != nil {
+	if err := PullSkill(skill, symlinkSource, PullOptions{}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -66,6 +66,13 @@ func cmdCollect(args []string) error {
 
 	applyModeLabel(mode)
 
+	// Collect gate: only allow in git worktree context (not main repo).
+	// Skills developed locally in targets should be collected via the worktree workflow.
+	// External skills should be fetched via `skillshare install`.
+	if !isWorktreeDir(cwd) {
+		return fmt.Errorf("collect is only available in a git worktree.\n\nTo develop skills:\n  skillshare worktree create <branch>\n\nTo install skills from remote sources:\n  skillshare install <source>")
+	}
+
 	kind, rest := parseKindArg(rest)
 	opts := parseCollectOptions(rest)
 	scope := "global"
