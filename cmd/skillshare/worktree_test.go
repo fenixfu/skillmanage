@@ -103,3 +103,126 @@ func TestWorktreeTarget_Integration(t *testing.T) {
 	os.Chdir(origDir)
 	worktree.Remove(repo, "feat/test-target", true)
 }
+
+func TestWorktreeMerge_CleanWorktree(t *testing.T) {
+	tmp := t.TempDir()
+	repo := setupTestRepo(t, tmp)
+
+	// Create a worktree
+	wt, err := worktree.Create(repo, "feat/merge-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Initialize skillshare + add a skill file to commit
+	if err := initWorktreeSkillshare(wt.Path, false); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(wt.Path, ".skillshare", "skills", "test-skill")
+	os.MkdirAll(skillDir, 0755)
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("# Test"), 0644)
+
+	// Commit in the worktree
+	exec.Command("git", "-C", wt.Path, "add", "-A").Run()
+	exec.Command("git", "-C", wt.Path, "commit", "-m", "add test skill").Run()
+
+	// Switch to the worktree dir and merge
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	os.Chdir(wt.Path)
+
+	err = worktreeMerge([]string{"feat/merge-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify worktree removed
+	wts, err := worktree.List(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range wts {
+		if w.Branch == "feat/merge-test" {
+			t.Error("worktree should have been removed after merge")
+		}
+	}
+
+	// Verify the commit is in the main branch
+	os.Chdir(repo)
+	out, err := exec.Command("git", "log", "--oneline").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "add test skill") {
+		t.Error("expected merge commit in main branch history")
+	}
+}
+
+func TestWorktreeMerge_DirtyWorktreeRefused(t *testing.T) {
+	tmp := t.TempDir()
+	repo := setupTestRepo(t, tmp)
+
+	wt, err := worktree.Create(repo, "feat/dirty-merge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initWorktreeSkillshare(wt.Path, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make an uncommitted change
+	os.WriteFile(filepath.Join(wt.Path, "uncommitted.txt"), []byte("dirty"), 0644)
+
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	os.Chdir(wt.Path)
+
+	err = worktreeMerge([]string{"feat/dirty-merge"})
+	if err == nil {
+		t.Error("expected error for dirty worktree without --force")
+	}
+	t.Logf("error: %v", err)
+
+	// Cleanup
+	os.Chdir(origDir)
+	worktree.Remove(repo, "feat/dirty-merge", true)
+}
+
+func TestWorktreeMerge_ForceDirty(t *testing.T) {
+	tmp := t.TempDir()
+	repo := setupTestRepo(t, tmp)
+
+	wt, err := worktree.Create(repo, "feat/force-dirty-merge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initWorktreeSkillshare(wt.Path, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit something so the branch has a commit to merge
+	os.MkdirAll(filepath.Join(wt.Path, ".skillshare", "skills", "skill-a"), 0755)
+	os.WriteFile(filepath.Join(wt.Path, ".skillshare", "skills", "skill-a", "SKILL.md"), []byte("# A"), 0644)
+	exec.Command("git", "-C", wt.Path, "add", "-A").Run()
+	exec.Command("git", "-C", wt.Path, "commit", "-m", "add skill a").Run()
+
+	// Make an uncommitted change
+	os.WriteFile(filepath.Join(wt.Path, "uncommitted.txt"), []byte("dirty"), 0644)
+
+	origDir, _ := os.Getwd()
+	defer os.Chdir(origDir)
+	os.Chdir(wt.Path)
+
+	err = worktreeMerge([]string{"feat/force-dirty-merge", "--force"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify merge succeeded despite dirty worktree
+	wts, _ := worktree.List(repo)
+	for _, w := range wts {
+		if w.Branch == "feat/force-dirty-merge" {
+			t.Error("worktree should have been removed after force merge")
+		}
+	}
+}

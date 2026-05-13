@@ -35,6 +35,8 @@ func cmdWorktree(args []string) error {
 		return worktreeRemove(subargs)
 	case "collect":
 		return worktreeCollect(subargs)
+	case "merge":
+		return worktreeMerge(subargs)
 	case "target":
 		return worktreeTarget(subargs)
 	default:
@@ -51,6 +53,27 @@ func requireRepoRoot() (string, error) {
 		return "", fmt.Errorf("not in a git repository (run from your skill-repo root)")
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// requireMainRepoRoot resolves the main repo root from a worktree path.
+// Reads the worktree's .git file to find the main repo location.
+func requireMainRepoRoot(wtPath string) (string, error) {
+	gitFile := filepath.Join(wtPath, ".git")
+	data, err := os.ReadFile(gitFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to read .git file in worktree: %w", err)
+	}
+	// .git file format: "gitdir: /path/to/main/.git/worktrees/name\n"
+	content := strings.TrimSpace(string(data))
+	const prefix = "gitdir: "
+	if !strings.HasPrefix(content, prefix) {
+		return "", fmt.Errorf("unexpected .git file format")
+	}
+	gitDir := strings.TrimPrefix(content, prefix)
+	// gitDir points to .../main/.git/worktrees/name
+	// parent of .git is the main repo: worktrees/name -> .git -> main
+	dotGit := filepath.Dir(filepath.Dir(filepath.Dir(gitDir)))
+	return dotGit, nil
 }
 
 // isWorktreeDir reports whether dir is a git worktree (not the main repo).
@@ -293,6 +316,228 @@ func worktreeRemove(args []string) error {
 	return nil
 }
 
+// worktreeMerge merges a feature worktree branch back to the main branch.
+func worktreeMerge(args []string) error {
+	force := false
+	for _, a := range args {
+		switch a {
+		case "--force", "-f":
+			force = true
+		case "--help", "-h":
+			fmt.Println("Usage: skillshare worktree merge <branch> [--force]")
+			fmt.Println()
+			fmt.Println("Merge a feature worktree branch into the main branch,")
+			fmt.Println("then remove the worktree and prune the feature branch.")
+			fmt.Println()
+			fmt.Println("Options:")
+			fmt.Println("  --force, -f  Skip safety checks (uncommitted changes, broken symlinks)")
+			fmt.Println("  --help, -h   Show this help")
+			return nil
+		}
+	}
+	var branchArgs []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			branchArgs = append(branchArgs, a)
+		}
+	}
+	if len(branchArgs) < 1 {
+		return fmt.Errorf("usage: skillshare worktree merge <branch>\nRun 'skillshare worktree merge --help' for details")
+	}
+	branch := branchArgs[0]
+
+	// First find the worktree — we need its path to resolve main repo
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("cannot determine working directory: %w", err)
+	}
+
+	// Use the current directory if it's a worktree, otherwise look up from main repo
+	var wtPath string
+	var repoPath string
+	if isWorktreeDir(cwd) {
+		wtPath = cwd
+		repoPath, err = requireMainRepoRoot(wtPath)
+		if err != nil {
+			return fmt.Errorf("cannot find main repo from worktree: %w", err)
+		}
+	} else {
+		repoPath, err = requireRepoRoot()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Verify worktree exists
+	wts, err := worktree.List(repoPath)
+	if err != nil {
+		return fmt.Errorf("failed to list worktrees: %w", err)
+	}
+	var wt *worktree.Worktree
+	for i := range wts {
+		if wts[i].Branch == branch {
+			wt = &wts[i]
+			break
+		}
+	}
+	if wt == nil {
+		return fmt.Errorf("worktree for branch %q not found", branch)
+	}
+	wtPath = wt.Path // use listed path (more reliable)
+
+	// Safety check: uncommitted changes in worktree
+	dirty, err := worktreeHasChanges(wt.Path)
+	if err != nil {
+		return fmt.Errorf("failed to check worktree status: %w", err)
+	}
+	if dirty && !force {
+		return fmt.Errorf("worktree %q has uncommitted changes.\nCommit them first, or use --force to discard.\nPath: %s", branch, wt.Path)
+	}
+
+	// Safety check: broken target symlinks
+	broken, err := checkBrokenTargetSymlinks(wt.Path)
+	if err != nil {
+		return fmt.Errorf("failed to check target symlinks: %w", err)
+	}
+	if len(broken) > 0 && !force {
+		msg := fmt.Sprintf("worktree has %d broken target symlink(s):\n", len(broken))
+		for _, b := range broken {
+			msg += fmt.Sprintf("  %s -> %s\n", b.name, b.target)
+		}
+		msg += "Fix them or use --force to proceed anyway."
+		return fmt.Errorf("%s", msg)
+	}
+
+	if dirty && force {
+		ui.Warning("Worktree has uncommitted changes (--force: proceeding anyway)")
+	}
+	if len(broken) > 0 && force {
+		ui.Warning("%d broken symlink(s) detected (--force: proceeding anyway)", len(broken))
+	}
+
+	// Switch to main branch in main repo
+	ui.Header(fmt.Sprintf("Merging %s", branch))
+	mainBranch := detectMainBranch(repoPath)
+	if err := gitCheckout(repoPath, mainBranch); err != nil {
+		return fmt.Errorf("failed to checkout %s: %w", mainBranch, err)
+	}
+
+	// Merge
+	if err := gitMerge(repoPath, branch); err != nil {
+		// Conflict — abort and leave worktree intact
+		_ = gitMergeAbort(repoPath)
+		return fmt.Errorf("merge conflict — aborted.\nWorktree preserved at: %s\nResolve manually and try again.", wt.Path)
+	}
+
+	ui.Success("Merged %s into %s", branch, mainBranch)
+
+	// Remove worktree
+	if err := worktree.Remove(repoPath, branch, true); err != nil {
+		ui.Warning("Merge succeeded but failed to remove worktree: %v", err)
+		ui.Info("Worktree path: %s", wt.Path)
+	} else {
+		ui.Success("Removed worktree for branch %q", branch)
+	}
+
+	// Next steps
+	fmt.Println()
+	ui.Header("Next steps")
+	ui.Info("Push to remote:   git push")
+	ui.Info("Distribute skills: skillshare sync -p")
+	return nil
+}
+
+// worktreeHasChanges reports whether the worktree has uncommitted changes.
+func worktreeHasChanges(wtPath string) (bool, error) {
+	cmd := exec.Command("git", "-C", wtPath, "status", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// brokenSymlink represents a broken target symlink.
+type brokenSymlink struct {
+	name   string
+	target string
+}
+
+// checkBrokenTargetSymlinks scans the worktree's target configs for broken symlinks.
+func checkBrokenTargetSymlinks(wtPath string) ([]brokenSymlink, error) {
+	cfg, err := config.LoadProject(wtPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var broken []brokenSymlink
+	for _, t := range cfg.Targets {
+		sc := t.SkillsConfig()
+		if sc.Path == "" {
+			continue
+		}
+		entries, err := os.ReadDir(sc.Path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		for _, entry := range entries {
+			if entry.Name()[0] == '.' {
+				continue
+			}
+			entryPath := filepath.Join(sc.Path, entry.Name())
+			info, err := os.Lstat(entryPath)
+			if err != nil {
+				continue
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				if _, err := os.Stat(entryPath); os.IsNotExist(err) {
+					target, _ := os.Readlink(entryPath)
+					broken = append(broken, brokenSymlink{name: entry.Name(), target: target})
+				}
+			}
+		}
+	}
+	return broken, nil
+}
+
+// detectMainBranch returns the main branch name (main or master).
+func detectMainBranch(repoPath string) string {
+	for _, branch := range []string{"main", "master"} {
+		cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", branch)
+		if err := cmd.Run(); err == nil {
+			return branch
+		}
+	}
+	return "main" // fallback
+}
+
+func gitCheckout(repoPath, branch string) error {
+	cmd := exec.Command("git", "-C", repoPath, "checkout", branch)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s\n%s", err, string(out))
+	}
+	return nil
+}
+
+func gitMerge(repoPath, branch string) error {
+	cmd := exec.Command("git", "-C", repoPath, "merge", branch)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s\n%s", err, string(out))
+	}
+	return nil
+}
+
+func gitMergeAbort(repoPath string) error {
+	cmd := exec.Command("git", "-C", repoPath, "merge", "--abort")
+	cmd.Run() // best-effort
+	return nil
+}
+
 // worktreeTarget dispatches `skillshare worktree target <add|list|remove>`.
 func worktreeTarget(args []string) error {
 	if len(args) < 1 {
@@ -471,6 +716,7 @@ func printWorktreeHelp() {
 	fmt.Println("  list                      List all worktrees")
 	fmt.Println("  select <branch>           Print the worktree path for the branch")
 	fmt.Println("  remove <branch> [--force] Remove a worktree")
+	fmt.Println("  merge <branch> [--force]  Merge feature branch to main")
 	fmt.Println("  target <subcommand>       Manage targets in the worktree")
 	fmt.Println("  collect <target>          Collect local skills from a target")
 	fmt.Println()
