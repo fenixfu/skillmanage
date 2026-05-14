@@ -38,7 +38,6 @@ This central skills repo owns the shared source of truth. Each worktree gets its
 
 ```bash
 cd <fork-repo>
-eval "$(/home/fenix/.local/bin/mise activate bash)"
 go build -o ./bin/skillshare ./cmd/skillshare
 sudo cp ./bin/skillshare /usr/local/bin/skillshare
 ```
